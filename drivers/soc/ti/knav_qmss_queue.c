@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/*
+/**
  * Keystone Queue Manager subsystem driver
  *
  * Copyright (C) 2014 Texas Instruments Incorporated - http://www.ti.com
- * Authors:	Sandeep Nair <sandeep_n@ti.com>
- *		Cyril Chemparathy <cyril@ti.com>
- *		Santosh Shilimkar <santosh.shilimkar@ti.com>
+ * Authors: Sandeep Nair <sandeep_n@ti.com>
+ *          Cyril Chemparathy <cyril@ti.com>
+ *          Santosh Shilimkar <santosh.shilimkar@ti.com>
  */
 
 #include <linux/debugfs.h>
@@ -1884,14 +1884,13 @@ err:
 
 static void knav_queue_remove(struct platform_device *pdev)
 {
-    struct knav_device *kdev = platform_get_drvdata(pdev);
+	struct knav_device *kdev = platform_get_drvdata(pdev);
 
-    knav_queue_stop_pdsps(kdev);
-    knav_queue_free_regions(kdev);
-    knav_free_queue_ranges(kdev);
-
-    pm_runtime_put_sync(&pdev->dev);
-    pm_runtime_disable(&pdev->dev);
+	knav_queue_stop_pdsps(kdev);
+	knav_queue_free_regions(kdev);
+	knav_free_queue_ranges(kdev);
+	pm_runtime_put_sync(&pdev->dev);
+	pm_runtime_disable(&pdev->dev);
 }
 
 static struct platform_driver keystone_qmss_driver = {
