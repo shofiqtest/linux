@@ -4,11 +4,15 @@
 $id: http://devicetree.org/schemas/iio/adc/ti,ads1298.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Texas Instruments' ads1298 medical ADC chips
+title: Texas Instruments ADS1298/ADS1299 biopotential ADC chips
 
 description: |
-  Datasheet at: https://www.ti.com/product/ADS1298
-  Bindings for this chip aren't complete.
+  ADS1298/ADS1298R: 8-channel, 24-bit ECG ADC. Max 12x PGA gain.
+  Datasheet: https://www.ti.com/product/ADS1298
+
+  ADS1299: 4/6/8-channel, 24-bit EEG/biopotential ADC. Max 24x PGA gain.
+  Channel count is discoverable from the ID register at runtime.
+  Datasheet: https://www.ti.com/product/ADS1299
 
 maintainers:
   - Mike Looijmans <mike.looijmans@topic.nl>
@@ -17,6 +21,7 @@ properties:
   compatible:
     enum:
       - ti,ads1298
+      - ti,ads1299
 
   reg:
     maxItems: 1
@@ -33,8 +38,7 @@ properties:
 
   vref-supply:
     description:
-      Optional reference voltage. If omitted, internal reference is used,
-      which is 2.4V when analog supply is below 4.4V, 4V otherwise.
+      Optional reference voltage. If omitted, internal reference is used.
 
   clocks:
     description: Optional 2.048 MHz external source clock on CLK pin
@@ -75,5 +79,6 @@ examples:
           spi-max-frequency = <20000000>;
           spi-cpha;
         };
+
     };
 ...
