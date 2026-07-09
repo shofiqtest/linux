@@ -343,12 +343,9 @@ static irqreturn_t max86150_interrupt_handler(int irq, void *private)
 
 	if (ovf > 0) {
 		/* FIFO overflowed; timestamps are unreliable - flush and discard */
-		ret = regmap_write(data->regmap, MAX86150_REG_FIFO_WR_PTR, 0);
-		ret |= regmap_write(data->regmap, MAX86150_REG_OVF_COUNTER, 0);
-		ret |= regmap_write(data->regmap, MAX86150_REG_FIFO_RD_PTR, 0);
-		if (ret)
-			dev_warn(regmap_get_device(data->regmap),
-				 "Failed to flush FIFO after overflow\n");
+		regmap_write(data->regmap, MAX86150_REG_FIFO_WR_PTR, 0);
+		regmap_write(data->regmap, MAX86150_REG_OVF_COUNTER, 0);
+		regmap_write(data->regmap, MAX86150_REG_FIFO_RD_PTR, 0);
 		return IRQ_HANDLED;
 	}
 
@@ -516,8 +513,9 @@ static int max86150_probe(struct i2c_client *client)
 		return dev_err_probe(dev, ret, "Cannot read part ID\n");
 
 	if (part_id != MAX86150_PART_ID_VAL)
-		dev_info(dev, "Unexpected part ID 0x%02x (expected 0x%02x)\n",
-			 part_id, MAX86150_PART_ID_VAL);
+		return dev_err_probe(dev, -ENODEV,
+				     "Unexpected part ID 0x%02x (expected 0x%02x)\n",
+				     part_id, MAX86150_PART_ID_VAL);
 
 	ret = max86150_chip_init(data);
 	if (ret)
@@ -548,7 +546,7 @@ static int max86150_probe(struct i2c_client *client)
 						irq_trig | IRQF_ONESHOT,
 						"max86150", indio_dev);
 		if (ret)
-			return ret;
+			return dev_err_probe(dev, ret, "Failed to request IRQ\n");
 	}
 
 	return devm_iio_device_register(dev, indio_dev);
