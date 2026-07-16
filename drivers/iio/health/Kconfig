@@ -66,7 +66,7 @@ config MAX86150
 	tristate "MAX86150 ECG and PPG biosensor"
 	depends on I2C
 	select IIO_BUFFER
-	select IIO_KFIFO_BUF
+	select IIO_TRIGGERED_BUFFER
 	select REGMAP_I2C
 	help
 	  Say Y here to enable support for the Maxim MAX86150 combined
