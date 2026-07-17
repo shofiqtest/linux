@@ -637,7 +637,7 @@ static int max86150_probe(struct i2c_client *client)
 						IRQF_ONESHOT,
 						"max86150", data->trig);
 		if (ret)
-			return dev_err_probe(dev, ret, "Failed to request IRQ\n");
+			return ret;
 
 		ret = devm_iio_trigger_register(dev, data->trig);
 		if (ret)
