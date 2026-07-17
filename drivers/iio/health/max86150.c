@@ -315,7 +315,7 @@ static int max86150_read_raw(struct iio_dev *indio_dev,
 
 static const struct iio_info max86150_iio_info = {
 	.read_raw         = max86150_read_raw,
-	.validate_trigger = iio_trigger_validate_own_device,
+	.validate_trigger = iio_validate_own_trigger,
 };
 
 static int max86150_trigger_disable(struct max86150_data *data)
@@ -542,6 +542,8 @@ static int max86150_chip_init(struct max86150_data *data)
 	if (ret)
 		return ret;
 
+	data->sample_period_ns = 10000000; /* matches MAX86150_PPG_SR_SP_100HZ above */
+
 	ret = regmap_write(data->regmap, MAX86150_REG_LED1_PA,
 			   MAX86150_LED_PA_DEFAULT);
 	if (ret)
@@ -551,8 +553,6 @@ static int max86150_chip_init(struct max86150_data *data)
 			   MAX86150_LED_PA_DEFAULT);
 	if (ret)
 		return ret;
-
-	data->sample_period_ns = 10000000; /* 100 Hz = 10 ms */
 
 	return regmap_write(data->regmap, MAX86150_REG_SYS_CTRL,
 			    MAX86150_SYS_SHDN);
@@ -574,23 +574,19 @@ static int max86150_probe(struct i2c_client *client)
 
 	ret = devm_regulator_get_enable(dev, "vdd");
 	if (ret)
-		return dev_err_probe(dev, ret,
-				     "Failed to get/enable vdd supply\n");
+		return dev_err_probe(dev, ret, "Failed to enable vdd supply\n");
 
 	ret = devm_regulator_get_enable(dev, "avdd");
 	if (ret)
-		return dev_err_probe(dev, ret,
-				     "Failed to get/enable avdd supply\n");
+		return dev_err_probe(dev, ret, "Failed to enable avdd supply\n");
 
 	ret = devm_regulator_get_enable(dev, "vref");
 	if (ret)
-		return dev_err_probe(dev, ret,
-				     "Failed to get/enable vref supply\n");
+		return dev_err_probe(dev, ret, "Failed to enable vref supply\n");
 
 	ret = devm_regulator_get_enable(dev, "leds");
 	if (ret)
-		return dev_err_probe(dev, ret,
-				     "Failed to get/enable leds supply\n");
+		return dev_err_probe(dev, ret, "Failed to enable leds supply\n");
 
 	data->regmap = devm_regmap_init_i2c(client, &max86150_regmap_config);
 	if (IS_ERR(data->regmap))
