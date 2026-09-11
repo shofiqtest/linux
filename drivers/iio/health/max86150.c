@@ -27,12 +27,11 @@
 #include <linux/regulator/consumer.h>
 #include <linux/time.h>
 #include <linux/types.h>
+#include <linux/unaligned.h>
 
 #include <linux/iio/buffer.h>
 #include <linux/iio/iio.h>
-#include <linux/iio/trigger.h>
-#include <linux/iio/trigger_consumer.h>
-#include <linux/iio/triggered_buffer.h>
+#include <linux/iio/kfifo_buf.h>
 
 #define MAX86150_REG_INT_STATUS1	0x00
 #define MAX86150_REG_INT_STATUS2	0x01
@@ -78,41 +77,36 @@
 #define MAX86150_PPG_ADC_RGE		GENMASK(7, 6)
 #define MAX86150_PPG_SR			GENMASK(5, 1)
 
-/* REVIEW(Andy Shevchenko): add a unit suffix "_nA" to each of these four defines */
 /* PPG ADC full-scale range (ADC_RGE field of PPG_CONFIG1) */
-#define MAX86150_PPG_ADC_RGE_4096	0	/* 4096 nA */
-#define MAX86150_PPG_ADC_RGE_8192	1	/* 8192 nA */
-#define MAX86150_PPG_ADC_RGE_16384	2	/* 16384 nA */
-#define MAX86150_PPG_ADC_RGE_32768	3	/* 32768 nA */
+#define MAX86150_PPG_ADC_RGE_4096_NA	0
+#define MAX86150_PPG_ADC_RGE_8192_NA	1
+#define MAX86150_PPG_ADC_RGE_16384_NA	2
+#define MAX86150_PPG_ADC_RGE_32768_NA	3
 
-/* REVIEW(Andy Shevchenko): "HZ" -> "_Hz" in every define name below */
 /* PPG sample rate (SR field of PPG_CONFIG1) - single-pulse variants */
-#define MAX86150_PPG_SR_SP_10HZ		0
-#define MAX86150_PPG_SR_SP_20HZ		1
-#define MAX86150_PPG_SR_SP_50HZ		2
-#define MAX86150_PPG_SR_SP_84HZ		3
-#define MAX86150_PPG_SR_SP_100HZ	4
-#define MAX86150_PPG_SR_SP_200HZ	5
-#define MAX86150_PPG_SR_SP_400HZ	6
-#define MAX86150_PPG_SR_SP_800HZ	7
-#define MAX86150_PPG_SR_SP_1000HZ	8
-#define MAX86150_PPG_SR_SP_1600HZ	9
-#define MAX86150_PPG_SR_SP_3200HZ	10
+#define MAX86150_PPG_SR_SP_10_HZ	0
+#define MAX86150_PPG_SR_SP_20_HZ	1
+#define MAX86150_PPG_SR_SP_50_HZ	2
+#define MAX86150_PPG_SR_SP_84_HZ	3
+#define MAX86150_PPG_SR_SP_100_HZ	4
+#define MAX86150_PPG_SR_SP_200_HZ	5
+#define MAX86150_PPG_SR_SP_400_HZ	6
+#define MAX86150_PPG_SR_SP_800_HZ	7
+#define MAX86150_PPG_SR_SP_1000_HZ	8
+#define MAX86150_PPG_SR_SP_1600_HZ	9
+#define MAX86150_PPG_SR_SP_3200_HZ	10
 /* Double-pulse variants (two LED pulses averaged per sample) */
-#define MAX86150_PPG_SR_DP_10HZ		11
-#define MAX86150_PPG_SR_DP_20HZ		12
-#define MAX86150_PPG_SR_DP_50HZ		13
-#define MAX86150_PPG_SR_DP_84HZ		14
-#define MAX86150_PPG_SR_DP_100HZ	15
-#define MAX86150_PPG_SR_DP_200HZ	16
-#define MAX86150_PPG_SR_DP_400HZ	17
-#define MAX86150_PPG_SR_DP_800HZ	18
-#define MAX86150_PPG_SR_DP_1000HZ	19
-#define MAX86150_PPG_SR_DP_1600HZ	20
-#define MAX86150_PPG_SR_DP_3200HZ	21
-
-/* REVIEW(Andy Shevchenko): "I am not sure where this comment is related to." -- reposition or drop */
-/* LED pulse amplitude: 0x00 = 0 mA, step ~0.8 mA, 0x3F ~= 50 mA, 0xFF ~= 200 mA */
+#define MAX86150_PPG_SR_DP_10_HZ	11
+#define MAX86150_PPG_SR_DP_20_HZ	12
+#define MAX86150_PPG_SR_DP_50_HZ	13
+#define MAX86150_PPG_SR_DP_84_HZ	14
+#define MAX86150_PPG_SR_DP_100_HZ	15
+#define MAX86150_PPG_SR_DP_200_HZ	16
+#define MAX86150_PPG_SR_DP_400_HZ	17
+#define MAX86150_PPG_SR_DP_800_HZ	18
+#define MAX86150_PPG_SR_DP_1000_HZ	19
+#define MAX86150_PPG_SR_DP_1600_HZ	20
+#define MAX86150_PPG_SR_DP_3200_HZ	21
 
 #define MAX86150_FIFO_DEPTH		32
 #define MAX86150_BYTES_PER_SLOT		3
@@ -122,6 +116,7 @@
 /* Samples available in the FIFO when the A_FULL interrupt fires */
 #define MAX86150_FIFO_A_FULL_SAMPLES	17
 
+/* LED pulse amplitude: 0x00 = 0 mA, step ~0.8 mA, 0x3F ~= 50 mA, 0xFF ~= 200 mA */
 #define MAX86150_LED_PA_DEFAULT		0x3F
 
 enum max86150_scan_idx {
@@ -131,31 +126,18 @@ enum max86150_scan_idx {
 	MAX86150_IDX_TS,
 };
 
-/*
- * REVIEW(Jonathan Cameron): "Why is it using a triggered buffer + trigger?
- * We normally don't do that when a hardware fifo is involved... Look at the
- * drivers that register a kfifo directly." -- see max30102.c in this same
- * directory for the reference pattern (devm_iio_kfifo_buffer_setup() +
- * iio_buffer_setup_ops.postenable/predisable, no iio_trigger at all).
- * If this redesign lands, the @trig field below goes away entirely.
- */
 /**
  * struct max86150_data - driver private state
  * @regmap:           register map for this device
- * @trig:             IIO hardware trigger backed by the device interrupt line
  * @sample_period_ns: sample period in nanoseconds (set from configured rate)
  * @fifo_raw:         scratch buffer for regmap_noinc_read() FIFO bursts; kept
  *                    in struct (heap) rather than on the stack, since stack
  *                    memory isn't guaranteed DMA-safe (e.g. CONFIG_VMAP_STACK)
  *                    and some I2C host controllers DMA the read buffer
- * @scan:             IIO push buffer; channels[] packed per active_scan_mask,
- *                    with a trailing aligned_s64 slot for the timestamp
- *                    REVIEW(Andy Shevchenko): "Again, unneeded detail, it's
- *                    visible from decoding _TS." -- drop this last clause
+ * @scan:             IIO push buffer; channels[] packed per active_scan_mask
  */
 struct max86150_data {
 	struct regmap		*regmap;
-	struct iio_trigger	*trig;		/* REVIEW(Jonathan): drop if redesigned onto kfifo */
 	u32			 sample_period_ns;
 	u8			 fifo_raw[MAX86150_SAMPLE_BYTES];
 	IIO_DECLARE_DMA_BUFFER_WITH_TS(s32, scan, MAX86150_NUM_SLOTS);
@@ -203,11 +185,27 @@ static const struct iio_chan_spec max86150_channels[] = {
 	IIO_CHAN_SOFT_TIMESTAMP(MAX86150_IDX_TS),
 };
 
-/* REVIEW(Andy Shevchenko): "No cache?" -- consider a regmap cache type */
+static bool max86150_volatile_reg(struct device *dev, unsigned int reg)
+{
+	switch (reg) {
+	case MAX86150_REG_INT_STATUS1:
+	case MAX86150_REG_INT_STATUS2:
+	case MAX86150_REG_FIFO_WR_PTR:
+	case MAX86150_REG_OVF_COUNTER:
+	case MAX86150_REG_FIFO_RD_PTR:
+	case MAX86150_REG_FIFO_DATA:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static const struct regmap_config max86150_regmap_config = {
 	.reg_bits     = 8,
 	.val_bits     = 8,
 	.max_register = MAX86150_REG_PART_ID,
+	.volatile_reg  = max86150_volatile_reg,
+	.cache_type   = REGCACHE_RBTREE,
 };
 
 static int max86150_read_one_sample(struct max86150_data *data,
@@ -220,17 +218,9 @@ static int max86150_read_one_sample(struct max86150_data *data,
 	if (ret)
 		return ret;
 
-	/*
-	 * REVIEW(Andy Shevchenko): use get_unaligned_be24() for all three of
-	 * these instead of the manual shift/or (he first said be16, then
-	 * self-corrected to be24 in his follow-up -- be24 is the one to use).
-	 */
-	*ppg_red = (data->fifo_raw[0] & 0x07) << 16 |
-		    data->fifo_raw[1] << 8 | data->fifo_raw[2];
-	*ppg_ir  = (data->fifo_raw[3] & 0x07) << 16 |
-		    data->fifo_raw[4] << 8 | data->fifo_raw[5];
-	*ecg = sign_extend32((data->fifo_raw[6] & 0x03) << 16 |
-			      data->fifo_raw[7] << 8 | data->fifo_raw[8], 17);
+	*ppg_red = get_unaligned_be24(&data->fifo_raw[0]) & GENMASK(18, 0);
+	*ppg_ir  = get_unaligned_be24(&data->fifo_raw[3]) & GENMASK(18, 0);
+	*ecg = sign_extend32(get_unaligned_be24(&data->fifo_raw[6]) & GENMASK(17, 0), 17);
 	return 0;
 }
 
@@ -332,42 +322,13 @@ static int max86150_read_raw(struct iio_dev *indio_dev,
 	}
 }
 
-/*
- * REVIEW(Jonathan Cameron) -- BIG ONE, applies to everything from here down
- * to the end of max86150_trigger_handler():
- *
- *   "Why is it using a triggered buffer + trigger? We normally don't do
- *   that when a hardware fifo is involved. [...] Look at the drivers that
- *   register a kfifo directly. [...] Normal thing to do in this case is
- *   no trigger + directly register a kfifo to fill from the hardware
- *   fifo. Simply turning that buffer on is the signal to begin capture."
- *
- * Reference: drivers/iio/health/max30102.c in this same directory already
- * does exactly this for a sibling Maxim part:
- *   - devm_iio_kfifo_buffer_setup(dev, indio_dev, &max30102_buffer_setup_ops)
- *     instead of devm_iio_triggered_buffer_setup() + a trigger object
- *   - iio_buffer_setup_ops { .postenable, .predisable } instead of
- *     iio_trigger_ops.set_trigger_state -- postenable powers the chip up
- *     and arms the interrupt (what max86150_trigger_enable() does today),
- *     predisable shuts it back down (what max86150_trigger_disable() does)
- *   - ONE threaded IRQ handler (primary=NULL) that drains the FIFO and
- *     calls iio_push_to_buffers_with_timestamp() directly -- no
- *     iio_trigger_poll()/iio_pollfunc_store_time indirection
- *
- * If this lands: max86150_trigger_ops, max86150_set_trigger_state,
- * .validate_trigger below, the trigger alloc/register block in
- * max86150_probe(), and the "set default trigger after buffer setup"
- * comment/code all disappear. max86150_trigger_enable()/_disable() get
- * renamed and become the postenable/predisable ops. max86150_irq_handler()
- * and max86150_trigger_handler() merge into one function.
- */
 static const struct iio_info max86150_iio_info = {
-	.read_raw         = max86150_read_raw,
-	.validate_trigger = iio_validate_own_trigger,	/* REVIEW(Jonathan): drops with kfifo redesign */
+	.read_raw = max86150_read_raw,
 };
 
-static int max86150_trigger_disable(struct max86150_data *data)
+static int max86150_buffer_predisable(struct iio_dev *indio_dev)
 {
+	struct max86150_data *data = iio_priv(indio_dev);
 	int ret;
 
 	ret = regmap_write(data->regmap, MAX86150_REG_INT_ENABLE1, 0);
@@ -377,8 +338,9 @@ static int max86150_trigger_disable(struct max86150_data *data)
 			       MAX86150_SYS_SHDN);
 }
 
-static int max86150_trigger_enable(struct max86150_data *data)
+static int max86150_buffer_postenable(struct iio_dev *indio_dev)
 {
+	struct max86150_data *data = iio_priv(indio_dev);
 	unsigned int dummy;
 	int ret;
 
@@ -400,7 +362,7 @@ static int max86150_trigger_enable(struct max86150_data *data)
 		goto err_shdn;
 
 	/*
-	 * Clear a stale A_FULL latched from before this trigger was enabled;
+	 * Clear a stale A_FULL latched from before the buffer was enabled;
 	 * otherwise arming INT_ENABLE1 below fires the handler immediately
 	 * against a FIFO state that was never actually seen as full.
 	 */
@@ -419,87 +381,52 @@ err_shdn:
 	return ret;
 }
 
-static int max86150_set_trigger_state(struct iio_trigger *trig, bool state)
-{
-	struct iio_dev *indio_dev = iio_trigger_get_drvdata(trig);
-	struct max86150_data *data = iio_priv(indio_dev);
-
-	if (state)
-		return max86150_trigger_enable(data);
-	return max86150_trigger_disable(data);
-}
-
-static const struct iio_trigger_ops max86150_trigger_ops = {	/* REVIEW(Jonathan): drops with kfifo redesign */
-	.set_trigger_state = max86150_set_trigger_state,
-	.validate_device   = iio_trigger_validate_own_device,
+static const struct iio_buffer_setup_ops max86150_buffer_setup_ops = {
+	.postenable = max86150_buffer_postenable,
+	.predisable = max86150_buffer_predisable,
 };
 
 /*
- * REVIEW(Jonathan Cameron): this hard-irq/threaded-trigger-handler split
- * exists to serialize with iio_trigger_poll(). If redesigned onto a kfifo
- * buffer (see the big comment above max86150_iio_info), this handler and
- * max86150_trigger_handler() below merge into a single threaded handler
- * (primary=NULL, like max30102_interrupt_handler() in max30102.c) that
- * clears INT_STATUS1, drains the FIFO, and pushes samples directly.
- */
-/*
- * Threaded IRQ handler: reads and clears INT_STATUS1 to de-assert the
- * hardware interrupt line BEFORE iio_trigger_poll() re-enables it.  This
- * prevents an IRQ storm on level-triggered lines where the line would
- * remain asserted until max86150_trigger_handler() ran later in its own
- * kthread — after IRQF_ONESHOT had already unmasked the IRQ.
+ * Threaded IRQ handler (primary=NULL): clears INT_STATUS1 to de-assert the
+ * line, then drains every sample currently in the FIFO and pushes each one
+ * straight to the buffer.  No trigger indirection -- enabling/disabling the
+ * buffer is what arms/disarms the interrupt, via
+ * max86150_buffer_postenable()/_predisable() above.  Matches the direct
+ * kfifo pattern max30102.c uses in this same directory.
  */
 static irqreturn_t max86150_irq_handler(int irq, void *private)
 {
-	struct iio_trigger *trig = private;
-	struct iio_dev *indio_dev = iio_trigger_get_drvdata(trig);
+	struct iio_dev *indio_dev = private;
 	struct max86150_data *data = iio_priv(indio_dev);
-	unsigned int status;
+	s64 irq_time = iio_get_time_ns(indio_dev);
+	unsigned int status, wr_ptr, rd_ptr, ovf, n_avail;
+	u32 ppg_red, ppg_ir;
+	s32 ecg;
 	int ret;
 
 	ret = regmap_read(data->regmap, MAX86150_REG_INT_STATUS1, &status);
 	if (ret || !(status & MAX86150_INT_A_FULL))
 		return IRQ_NONE;
 
-	iio_trigger_poll(trig);
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t max86150_trigger_handler(int irq, void *p)
-{
-	struct iio_poll_func *pf = p;
-	struct iio_dev *idev = pf->indio_dev;
-	struct max86150_data *data = iio_priv(idev);
-	unsigned int wr_ptr, rd_ptr, ovf, n_avail;
-	u32 ppg_red, ppg_ir;
-	s32 ecg;
-	s64 t_drain = 0;
-	int ret;
-
-	/*
-	 * INT_STATUS1 was already read (and the interrupt de-asserted) by
-	 * max86150_irq_handler().  Read only the FIFO pointers here.
-	 */
 	ret = regmap_read(data->regmap, MAX86150_REG_FIFO_WR_PTR, &wr_ptr);
 	if (ret)
-		goto done;
+		return IRQ_HANDLED;
 	ret = regmap_read(data->regmap, MAX86150_REG_FIFO_RD_PTR, &rd_ptr);
 	if (ret)
-		goto done;
+		return IRQ_HANDLED;
 	ret = regmap_read(data->regmap, MAX86150_REG_OVF_COUNTER, &ovf);
 	if (ret)
-		goto done;
+		return IRQ_HANDLED;
 
 	if (ovf > 0) {
 		n_avail = MAX86150_FIFO_DEPTH;
-		t_drain = iio_get_time_ns(idev);
 	} else {
 		n_avail = (wr_ptr - rd_ptr) & (MAX86150_FIFO_DEPTH - 1);
 		/*
 		 * wr_ptr == rd_ptr with no overflow means either empty or
 		 * exactly 32 slots filled (pointer wrapped).  Since this
-		 * handler is only called when A_FULL fired, the FIFO must
-		 * be full — treat as 32 available.
+		 * handler only runs when A_FULL fired, the FIFO must be
+		 * full — treat as 32 available.
 		 */
 		if (n_avail == 0)
 			n_avail = MAX86150_FIFO_DEPTH;
@@ -510,10 +437,10 @@ static irqreturn_t max86150_trigger_handler(int irq, void *p)
 		s64 ts;
 
 		if (ovf > 0)
-			ts = t_drain -
+			ts = irq_time -
 			     (s64)(n_avail - 1 - i) * data->sample_period_ns;
 		else
-			ts = pf->timestamp +
+			ts = irq_time +
 			     ((s64)i - (MAX86150_FIFO_A_FULL_SAMPLES - 1)) *
 			     data->sample_period_ns;
 
@@ -523,18 +450,16 @@ static irqreturn_t max86150_trigger_handler(int irq, void *p)
 
 		memset(data->scan, 0, sizeof(data->scan));
 
-		if (test_bit(MAX86150_IDX_PPG_RED, idev->active_scan_mask))
+		if (test_bit(MAX86150_IDX_PPG_RED, indio_dev->active_scan_mask))
 			data->scan[j++] = ppg_red;
-		if (test_bit(MAX86150_IDX_PPG_IR, idev->active_scan_mask))
+		if (test_bit(MAX86150_IDX_PPG_IR, indio_dev->active_scan_mask))
 			data->scan[j++] = ppg_ir;
-		if (test_bit(MAX86150_IDX_ECG, idev->active_scan_mask))
+		if (test_bit(MAX86150_IDX_ECG, indio_dev->active_scan_mask))
 			data->scan[j++] = ecg;
 
-		iio_push_to_buffers_with_timestamp(idev, data->scan, ts);
+		iio_push_to_buffers_with_timestamp(indio_dev, data->scan, ts);
 	}
 
-done:
-	iio_trigger_notify_done(idev->trig);
 	return IRQ_HANDLED;
 }
 
@@ -592,14 +517,14 @@ static int max86150_chip_init(struct max86150_data *data)
 
 	ret = regmap_write(data->regmap, MAX86150_REG_PPG_CONFIG1,
 			   FIELD_PREP(MAX86150_PPG_ADC_RGE,
-				      MAX86150_PPG_ADC_RGE_16384) |
+				      MAX86150_PPG_ADC_RGE_16384_NA) |
 			   FIELD_PREP(MAX86150_PPG_SR,
-				      MAX86150_PPG_SR_SP_100HZ));
+				      MAX86150_PPG_SR_SP_100_HZ));
 	if (ret)
 		return ret;
 
-	/* REVIEW(Jonathan Cameron): "Probably express as NANO / 100" */
-	data->sample_period_ns = 10000000; /* matches MAX86150_PPG_SR_SP_100HZ above */
+	/* matches MAX86150_PPG_SR_SP_100_HZ above */
+	data->sample_period_ns = NSEC_PER_SEC / 100;
 
 	ret = regmap_write(data->regmap, MAX86150_REG_LED1_PA,
 			   MAX86150_LED_PA_DEFAULT);
@@ -615,6 +540,10 @@ static int max86150_chip_init(struct max86150_data *data)
 			    MAX86150_SYS_SHDN);
 }
 
+static const char * const max86150_supply_names[] = {
+	"vdd", "avdd", "vref", "leds",
+};
+
 static int max86150_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -629,25 +558,10 @@ static int max86150_probe(struct i2c_client *client)
 
 	data = iio_priv(indio_dev);
 
-	/*
-	 * REVIEW(Jonathan Cameron): "Given there are 4 of these
-	 * devm_regulator_bulk_get_enable() probably makes sense."
-	 */
-	ret = devm_regulator_get_enable(dev, "vdd");
+	ret = devm_regulator_bulk_get_enable(dev, ARRAY_SIZE(max86150_supply_names),
+					     max86150_supply_names);
 	if (ret)
-		return dev_err_probe(dev, ret, "Failed to enable vdd supply\n");
-
-	ret = devm_regulator_get_enable(dev, "avdd");
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to enable avdd supply\n");
-
-	ret = devm_regulator_get_enable(dev, "vref");
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to enable vref supply\n");
-
-	ret = devm_regulator_get_enable(dev, "leds");
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to enable leds supply\n");
+		return dev_err_probe(dev, ret, "Failed to enable supplies\n");
 
 	data->regmap = devm_regmap_init_i2c(client, &max86150_regmap_config);
 	if (IS_ERR(data->regmap))
@@ -659,12 +573,11 @@ static int max86150_probe(struct i2c_client *client)
 		return dev_err_probe(dev, ret, "Cannot read part ID\n");
 
 	/*
-	 * REVIEW(Jonathan Cameron): "This breaks fallback dt compatibles.
-	 * Normally if we get a mismatch we just print a message and carry
-	 * on anyway. If we need to not do that for some reason here add a
-	 * comment to that effect." -- v10 deliberately made this fatal
-	 * (see cover letter changelog); either revert to dev_warn()+continue
-	 * or add the justifying comment he's asking for.
+	 * Deliberately fatal, not a dev_warn()+continue: chip_init() below
+	 * writes FIFO/PPG/LED configuration blind, with no readback. A
+	 * mismatched part ID means either the wrong device is on this
+	 * address or the bus itself is faulty, and letting chip_init()
+	 * write to that is a worse default than refusing to bind.
 	 */
 	if (part_id != MAX86150_PART_ID_VAL)
 		return dev_err_probe(dev, -ENODEV,
@@ -685,69 +598,20 @@ static int max86150_probe(struct i2c_client *client)
 	indio_dev->info         = &max86150_iio_info;
 	indio_dev->modes        = INDIO_DIRECT_MODE;
 
-	/*
-	 * REVIEW(Jonathan Cameron): everything in this block down to
-	 * devm_iio_triggered_buffer_setup() is the part he wants redesigned
-	 * onto a kfifo buffer -- see max30102_probe() in max30102.c for the
-	 * replacement shape: devm_iio_kfifo_buffer_setup() up where indio_dev
-	 * fields are being filled in, then just a plain
-	 * devm_request_threaded_irq(dev, client->irq, NULL,
-	 * max86150_irq_handler, IRQF_ONESHOT, "max86150", indio_dev) with no
-	 * trigger object at all.
-	 */
+	ret = devm_iio_kfifo_buffer_setup(dev, indio_dev,
+					  &max86150_buffer_setup_ops);
+	if (ret)
+		return ret;
+
 	if (client->irq > 0) {
-		data->trig = devm_iio_trigger_alloc(dev, "%s-dev%d",
-						    indio_dev->name,
-						    iio_device_id(indio_dev));
-		if (!data->trig)
-			return -ENOMEM;
-
-		data->trig->ops = &max86150_trigger_ops;
-		iio_trigger_set_drvdata(data->trig, indio_dev);
-
-		/*
-		 * REVIEW(Andy Shevchenko / Jonathan Cameron): "Not need to
-		 * say this. It is most common situation." -- drop this
-		 * comment (also moot if the kfifo redesign removes the
-		 * trigger path entirely).
-		 * The device only ever drives an active-low interrupt line;
-		 * there is no register to reconfigure its polarity or type,
-		 * so the trigger type from firmware needs no help here.
-		 */
 		ret = devm_request_threaded_irq(dev, client->irq,
 						NULL,
 						max86150_irq_handler,
 						IRQF_ONESHOT,
-						"max86150", data->trig);
+						"max86150", indio_dev);
 		if (ret)
 			return ret;
-
-		ret = devm_iio_trigger_register(dev, data->trig);
-		if (ret)
-			return dev_err_probe(dev, ret,
-					     "Failed to register trigger\n");
 	}
-
-	ret = devm_iio_triggered_buffer_setup(dev, indio_dev,
-					      iio_pollfunc_store_time,
-					      max86150_trigger_handler,
-					      NULL);
-	if (ret)
-		return ret;
-
-	/*
-	 * REVIEW(Jonathan Cameron): "I don't believe there is anything
-	 * stopping you just registering the triggered_buffer before the
-	 * trigger. That would get rid of this complexity." -- moot entirely
-	 * if the kfifo redesign lands (no trigger object to sequence
-	 * against at all).
-	 * Set the default trigger AFTER buffer setup succeeds.  Setting it
-	 * before would leak the iio_trigger_get() reference if buffer setup
-	 * failed: INDIO_BUFFER_TRIGGERED is not set on that path so
-	 * iio_device_release() skips iio_trigger_put().
-	 */
-	if (data->trig)
-		indio_dev->trig = iio_trigger_get(data->trig);
 
 	return devm_iio_device_register(dev, indio_dev);
 }
