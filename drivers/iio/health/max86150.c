@@ -78,12 +78,14 @@
 #define MAX86150_PPG_ADC_RGE		GENMASK(7, 6)
 #define MAX86150_PPG_SR			GENMASK(5, 1)
 
+/* REVIEW(Andy Shevchenko): add a unit suffix "_nA" to each of these four defines */
 /* PPG ADC full-scale range (ADC_RGE field of PPG_CONFIG1) */
 #define MAX86150_PPG_ADC_RGE_4096	0	/* 4096 nA */
 #define MAX86150_PPG_ADC_RGE_8192	1	/* 8192 nA */
 #define MAX86150_PPG_ADC_RGE_16384	2	/* 16384 nA */
 #define MAX86150_PPG_ADC_RGE_32768	3	/* 32768 nA */
 
+/* REVIEW(Andy Shevchenko): "HZ" -> "_Hz" in every define name below */
 /* PPG sample rate (SR field of PPG_CONFIG1) - single-pulse variants */
 #define MAX86150_PPG_SR_SP_10HZ		0
 #define MAX86150_PPG_SR_SP_20HZ		1
@@ -109,6 +111,7 @@
 #define MAX86150_PPG_SR_DP_1600HZ	20
 #define MAX86150_PPG_SR_DP_3200HZ	21
 
+/* REVIEW(Andy Shevchenko): "I am not sure where this comment is related to." -- reposition or drop */
 /* LED pulse amplitude: 0x00 = 0 mA, step ~0.8 mA, 0x3F ~= 50 mA, 0xFF ~= 200 mA */
 
 #define MAX86150_FIFO_DEPTH		32
@@ -128,6 +131,14 @@ enum max86150_scan_idx {
 	MAX86150_IDX_TS,
 };
 
+/*
+ * REVIEW(Jonathan Cameron): "Why is it using a triggered buffer + trigger?
+ * We normally don't do that when a hardware fifo is involved... Look at the
+ * drivers that register a kfifo directly." -- see max30102.c in this same
+ * directory for the reference pattern (devm_iio_kfifo_buffer_setup() +
+ * iio_buffer_setup_ops.postenable/predisable, no iio_trigger at all).
+ * If this redesign lands, the @trig field below goes away entirely.
+ */
 /**
  * struct max86150_data - driver private state
  * @regmap:           register map for this device
@@ -139,10 +150,12 @@ enum max86150_scan_idx {
  *                    and some I2C host controllers DMA the read buffer
  * @scan:             IIO push buffer; channels[] packed per active_scan_mask,
  *                    with a trailing aligned_s64 slot for the timestamp
+ *                    REVIEW(Andy Shevchenko): "Again, unneeded detail, it's
+ *                    visible from decoding _TS." -- drop this last clause
  */
 struct max86150_data {
 	struct regmap		*regmap;
-	struct iio_trigger	*trig;
+	struct iio_trigger	*trig;		/* REVIEW(Jonathan): drop if redesigned onto kfifo */
 	u32			 sample_period_ns;
 	u8			 fifo_raw[MAX86150_SAMPLE_BYTES];
 	IIO_DECLARE_DMA_BUFFER_WITH_TS(s32, scan, MAX86150_NUM_SLOTS);
@@ -190,6 +203,7 @@ static const struct iio_chan_spec max86150_channels[] = {
 	IIO_CHAN_SOFT_TIMESTAMP(MAX86150_IDX_TS),
 };
 
+/* REVIEW(Andy Shevchenko): "No cache?" -- consider a regmap cache type */
 static const struct regmap_config max86150_regmap_config = {
 	.reg_bits     = 8,
 	.val_bits     = 8,
@@ -206,6 +220,11 @@ static int max86150_read_one_sample(struct max86150_data *data,
 	if (ret)
 		return ret;
 
+	/*
+	 * REVIEW(Andy Shevchenko): use get_unaligned_be24() for all three of
+	 * these instead of the manual shift/or (he first said be16, then
+	 * self-corrected to be24 in his follow-up -- be24 is the one to use).
+	 */
 	*ppg_red = (data->fifo_raw[0] & 0x07) << 16 |
 		    data->fifo_raw[1] << 8 | data->fifo_raw[2];
 	*ppg_ir  = (data->fifo_raw[3] & 0x07) << 16 |
@@ -313,9 +332,38 @@ static int max86150_read_raw(struct iio_dev *indio_dev,
 	}
 }
 
+/*
+ * REVIEW(Jonathan Cameron) -- BIG ONE, applies to everything from here down
+ * to the end of max86150_trigger_handler():
+ *
+ *   "Why is it using a triggered buffer + trigger? We normally don't do
+ *   that when a hardware fifo is involved. [...] Look at the drivers that
+ *   register a kfifo directly. [...] Normal thing to do in this case is
+ *   no trigger + directly register a kfifo to fill from the hardware
+ *   fifo. Simply turning that buffer on is the signal to begin capture."
+ *
+ * Reference: drivers/iio/health/max30102.c in this same directory already
+ * does exactly this for a sibling Maxim part:
+ *   - devm_iio_kfifo_buffer_setup(dev, indio_dev, &max30102_buffer_setup_ops)
+ *     instead of devm_iio_triggered_buffer_setup() + a trigger object
+ *   - iio_buffer_setup_ops { .postenable, .predisable } instead of
+ *     iio_trigger_ops.set_trigger_state -- postenable powers the chip up
+ *     and arms the interrupt (what max86150_trigger_enable() does today),
+ *     predisable shuts it back down (what max86150_trigger_disable() does)
+ *   - ONE threaded IRQ handler (primary=NULL) that drains the FIFO and
+ *     calls iio_push_to_buffers_with_timestamp() directly -- no
+ *     iio_trigger_poll()/iio_pollfunc_store_time indirection
+ *
+ * If this lands: max86150_trigger_ops, max86150_set_trigger_state,
+ * .validate_trigger below, the trigger alloc/register block in
+ * max86150_probe(), and the "set default trigger after buffer setup"
+ * comment/code all disappear. max86150_trigger_enable()/_disable() get
+ * renamed and become the postenable/predisable ops. max86150_irq_handler()
+ * and max86150_trigger_handler() merge into one function.
+ */
 static const struct iio_info max86150_iio_info = {
 	.read_raw         = max86150_read_raw,
-	.validate_trigger = iio_validate_own_trigger,
+	.validate_trigger = iio_validate_own_trigger,	/* REVIEW(Jonathan): drops with kfifo redesign */
 };
 
 static int max86150_trigger_disable(struct max86150_data *data)
@@ -381,11 +429,19 @@ static int max86150_set_trigger_state(struct iio_trigger *trig, bool state)
 	return max86150_trigger_disable(data);
 }
 
-static const struct iio_trigger_ops max86150_trigger_ops = {
+static const struct iio_trigger_ops max86150_trigger_ops = {	/* REVIEW(Jonathan): drops with kfifo redesign */
 	.set_trigger_state = max86150_set_trigger_state,
 	.validate_device   = iio_trigger_validate_own_device,
 };
 
+/*
+ * REVIEW(Jonathan Cameron): this hard-irq/threaded-trigger-handler split
+ * exists to serialize with iio_trigger_poll(). If redesigned onto a kfifo
+ * buffer (see the big comment above max86150_iio_info), this handler and
+ * max86150_trigger_handler() below merge into a single threaded handler
+ * (primary=NULL, like max30102_interrupt_handler() in max30102.c) that
+ * clears INT_STATUS1, drains the FIFO, and pushes samples directly.
+ */
 /*
  * Threaded IRQ handler: reads and clears INT_STATUS1 to de-assert the
  * hardware interrupt line BEFORE iio_trigger_poll() re-enables it.  This
@@ -542,6 +598,7 @@ static int max86150_chip_init(struct max86150_data *data)
 	if (ret)
 		return ret;
 
+	/* REVIEW(Jonathan Cameron): "Probably express as NANO / 100" */
 	data->sample_period_ns = 10000000; /* matches MAX86150_PPG_SR_SP_100HZ above */
 
 	ret = regmap_write(data->regmap, MAX86150_REG_LED1_PA,
@@ -572,6 +629,10 @@ static int max86150_probe(struct i2c_client *client)
 
 	data = iio_priv(indio_dev);
 
+	/*
+	 * REVIEW(Jonathan Cameron): "Given there are 4 of these
+	 * devm_regulator_bulk_get_enable() probably makes sense."
+	 */
 	ret = devm_regulator_get_enable(dev, "vdd");
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to enable vdd supply\n");
@@ -597,6 +658,14 @@ static int max86150_probe(struct i2c_client *client)
 	if (ret)
 		return dev_err_probe(dev, ret, "Cannot read part ID\n");
 
+	/*
+	 * REVIEW(Jonathan Cameron): "This breaks fallback dt compatibles.
+	 * Normally if we get a mismatch we just print a message and carry
+	 * on anyway. If we need to not do that for some reason here add a
+	 * comment to that effect." -- v10 deliberately made this fatal
+	 * (see cover letter changelog); either revert to dev_warn()+continue
+	 * or add the justifying comment he's asking for.
+	 */
 	if (part_id != MAX86150_PART_ID_VAL)
 		return dev_err_probe(dev, -ENODEV,
 				     "Unexpected part ID 0x%02x (expected 0x%02x)\n",
@@ -616,6 +685,16 @@ static int max86150_probe(struct i2c_client *client)
 	indio_dev->info         = &max86150_iio_info;
 	indio_dev->modes        = INDIO_DIRECT_MODE;
 
+	/*
+	 * REVIEW(Jonathan Cameron): everything in this block down to
+	 * devm_iio_triggered_buffer_setup() is the part he wants redesigned
+	 * onto a kfifo buffer -- see max30102_probe() in max30102.c for the
+	 * replacement shape: devm_iio_kfifo_buffer_setup() up where indio_dev
+	 * fields are being filled in, then just a plain
+	 * devm_request_threaded_irq(dev, client->irq, NULL,
+	 * max86150_irq_handler, IRQF_ONESHOT, "max86150", indio_dev) with no
+	 * trigger object at all.
+	 */
 	if (client->irq > 0) {
 		data->trig = devm_iio_trigger_alloc(dev, "%s-dev%d",
 						    indio_dev->name,
@@ -627,6 +706,10 @@ static int max86150_probe(struct i2c_client *client)
 		iio_trigger_set_drvdata(data->trig, indio_dev);
 
 		/*
+		 * REVIEW(Andy Shevchenko / Jonathan Cameron): "Not need to
+		 * say this. It is most common situation." -- drop this
+		 * comment (also moot if the kfifo redesign removes the
+		 * trigger path entirely).
 		 * The device only ever drives an active-low interrupt line;
 		 * there is no register to reconfigure its polarity or type,
 		 * so the trigger type from firmware needs no help here.
@@ -653,6 +736,11 @@ static int max86150_probe(struct i2c_client *client)
 		return ret;
 
 	/*
+	 * REVIEW(Jonathan Cameron): "I don't believe there is anything
+	 * stopping you just registering the triggered_buffer before the
+	 * trigger. That would get rid of this complexity." -- moot entirely
+	 * if the kfifo redesign lands (no trigger object to sequence
+	 * against at all).
 	 * Set the default trigger AFTER buffer setup succeeds.  Setting it
 	 * before would leak the iio_trigger_get() reference if buffer setup
 	 * failed: INDIO_BUFFER_TRIGGERED is not set on that path so
