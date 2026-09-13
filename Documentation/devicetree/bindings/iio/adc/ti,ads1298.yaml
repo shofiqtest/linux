@@ -4,11 +4,20 @@
 $id: http://devicetree.org/schemas/iio/adc/ti,ads1298.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Texas Instruments' ads1298 medical ADC chips
+title: Texas Instruments' ads1298 and ads1299 medical ADC chips
 
 description: |
   Datasheet at: https://www.ti.com/product/ADS1298
+  Datasheet at: https://www.ti.com/product/ADS1299
   Bindings for this chip aren't complete.
+
+  ADS1298 and ADS1299 both come in 4/6/8-channel variants (e.g. ADS1294,
+  ADS1296, ADS1298 or ADS1299-4, ADS1299-6, ADS1299), which are pin- and
+  register-compatible within each family and only differ in the number of
+  channels reported by the chip's own ID register. A single compatible
+  string per family is therefore enough; the driver reads the channel
+  count back from silicon at probe time, the same way it already does
+  for ti,ads1298.
 
 maintainers:
   - Mike Looijmans <mike.looijmans@topic.nl>
@@ -17,6 +26,7 @@ properties:
   compatible:
     enum:
       - ti,ads1298
+      - ti,ads1299
 
   reg:
     maxItems: 1
@@ -33,8 +43,10 @@ properties:
 
   vref-supply:
     description:
-      Optional reference voltage. If omitted, internal reference is used,
-      which is 2.4V when analog supply is below 4.4V, 4V otherwise.
+      Optional reference voltage. If omitted, internal reference is used.
+      For ti,ads1298 this is 2.4V when analog supply is below 4.4V, 4V
+      otherwise. For ti,ads1299 the internal reference is fixed at 4.5V
+      (typical); there is no supply-dependent selection.
 
   clocks:
     description: Optional 2.048 MHz external source clock on CLK pin
