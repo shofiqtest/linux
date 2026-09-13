@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-/* TI ADS1298 chip family driver
+/* TI ADS1298/ADS1299 biopotential ADC driver
  * Copyright (C) 2023 - 2024 Topic Embedded Products
+ * Copyright (C) 2026 Md Shofiqul Islam <shofiqtest@gmail.com>
  */
 
 #include <linux/bitfield.h>
@@ -43,6 +44,18 @@
 #define ADS1298_MASK_ID_CHANNELS		GENMASK(2, 0)
 #define ADS1298_ID_FAMILY_ADS129X		0x90
 #define ADS1298_ID_FAMILY_ADS129XR		0xd0
+/*
+ * ADS1299 ID register layout differs from ADS1298 (datasheet SBAS499,
+ * "ID Control Register"): bit 4 is a separate reserved bit that always
+ * reads back 1, and is not part of the family field.  DEV_ID[1:0], the
+ * actual family identifier, is bits [3:2] and reads 0b11 for the whole
+ * ADS1299-x family.  NU_CH[1:0] (channel count) is bits [1:0]: 00 -> 4
+ * channels (ADS1299-4), 01 -> 6 channels (ADS1299-6), 10 -> 8 channels
+ * (ADS1299).
+ */
+#define ADS1299_MASK_ID_DEV			GENMASK(3, 2)
+#define ADS1299_ID_DEV_EEG			0x3
+#define ADS1299_MASK_ID_CHANNELS		GENMASK(1, 0)
 
 #define ADS1298_REG_CONFIG1	0x01
 #define ADS1298_MASK_CONFIG1_HR			BIT(7)
@@ -64,6 +77,12 @@
 #define ADS1298_MASK_CONFIG3_PWR_REFBUF		BIT(7)
 #define ADS1298_MASK_CONFIG3_RESERVED		BIT(6)
 #define ADS1298_MASK_CONFIG3_VREF_4V		BIT(5)
+/*
+ * ADS1299 has no VREF_4V select bit (CONFIG3 bits [6:5] are both reserved,
+ * "always write 3h").  Its internal reference is fixed; datasheet SBAS499
+ * Electrical Characteristics lists it as 4.5V typical, not 2.4V.
+ */
+#define ADS1299_VREF_INTERNAL_MV		4500
 
 #define ADS1298_REG_LOFF	0x04
 #define ADS1298_REG_CHnSET(n)	(0x05 + (n))
@@ -277,6 +296,28 @@ static int ads1298_set_samp_freq(struct ads1298_private *priv, int val)
 }
 
 static const u8 ads1298_pga_settings[] = { 6, 1, 2, 3, 4, 8, 12 };
+/* ADS1299 PGA: register bits [6:4] -> gain (000=1, 001=2, 010=4, ...) */
+static const u8 ads1299_pga_settings[] = { 1, 2, 4, 6, 8, 12, 24 };
+
+/*
+ * Per-family data, selected via SPI/OF match data rather than decoded from
+ * chip registers at runtime, since only the channel count actually needs
+ * to be read from silicon (NU_CH/DEV_ID channel bits) -- which family we
+ * are talking to is already known from the compatible string that matched.
+ */
+struct ads1298_chip_info {
+	const u8 *pga_settings;
+	bool is_ads1299;
+};
+
+static const struct ads1298_chip_info ads1298_chip_info = {
+	.pga_settings = ads1298_pga_settings,
+};
+
+static const struct ads1298_chip_info ads1299_chip_info = {
+	.pga_settings = ads1299_pga_settings,
+	.is_ads1299 = true,
+};
 
 static int ads1298_get_scale(struct ads1298_private *priv,
 			     int channel, int *val, int *val2)
@@ -292,6 +333,8 @@ static int ads1298_get_scale(struct ads1298_private *priv,
 			return ret;
 
 		*val = ret / MILLI; /* Convert to millivolts */
+	} else if (priv->chip_info->is_ads1299) {
+		*val = ADS1299_VREF_INTERNAL_MV;
 	} else {
 		ret = regmap_read(priv->regmap, ADS1298_REG_CONFIG3, &regval);
 		if (ret)
@@ -309,7 +352,7 @@ static int ads1298_get_scale(struct ads1298_private *priv,
 	if (pga_idx >= ARRAY_SIZE(ads1298_pga_settings))
 		return -EINVAL;
 
-	gain = ads1298_pga_settings[pga_idx];
+	gain = priv->chip_info->pga_settings[pga_idx];
 	*val /= gain; /* Full scale is VREF / gain */
 
 	*val2 = ADS1298_BITS_PER_SAMPLE - 1; /* Signed, hence the -1 */
@@ -605,20 +648,37 @@ static int ads1298_init(struct iio_dev *indio_dev)
 	if (ret)
 		return ret;
 
-	/* Fill in name and channel count based on what the chip told us */
-	indio_dev->num_channels = 4 + 2 * (val & ADS1298_MASK_ID_CHANNELS);
-	switch (val & ADS1298_MASK_ID_FAMILY) {
-	case ADS1298_ID_FAMILY_ADS129X:
-		suffix = "";
-		break;
-	case ADS1298_ID_FAMILY_ADS129XR:
-		suffix = "r";
-		break;
-	default:
-		return dev_err_probe(dev, -ENODEV, "Unknown ID: 0x%x\n", val);
+	if (priv->chip_info->is_ads1299) {
+		if (FIELD_GET(ADS1299_MASK_ID_DEV, val) != ADS1299_ID_DEV_EEG)
+			return dev_err_probe(dev, -ENODEV, "Unknown ID: 0x%x\n", val);
+
+		indio_dev->num_channels =
+			(FIELD_GET(ADS1299_MASK_ID_CHANNELS, val) + 2) * 2;
+
+		if (indio_dev->num_channels == 8)
+			suffix = "";
+		else if (indio_dev->num_channels == 6)
+			suffix = "-6";
+		else
+			suffix = "-4";
+
+		indio_dev->name = devm_kasprintf(dev, GFP_KERNEL, "ads1299%s", suffix);
+	} else {
+		/* Fill in name and channel count based on what the chip told us */
+		indio_dev->num_channels = 4 + 2 * (val & ADS1298_MASK_ID_CHANNELS);
+		switch (val & ADS1298_MASK_ID_FAMILY) {
+		case ADS1298_ID_FAMILY_ADS129X:
+			suffix = "";
+			break;
+		case ADS1298_ID_FAMILY_ADS129XR:
+			suffix = "r";
+			break;
+		default:
+			return dev_err_probe(dev, -ENODEV, "Unknown ID: 0x%x\n", val);
+		}
+		indio_dev->name = devm_kasprintf(dev, GFP_KERNEL, "ads129%u%s",
+						 indio_dev->num_channels, suffix);
 	}
-	indio_dev->name = devm_kasprintf(dev, GFP_KERNEL, "ads129%u%s",
-					 indio_dev->num_channels, suffix);
 	if (!indio_dev->name)
 		return -ENOMEM;
 
@@ -626,8 +686,9 @@ static int ads1298_init(struct iio_dev *indio_dev)
 	if (!priv->reg_vref) {
 		/* Enable internal reference */
 		val |= ADS1298_MASK_CONFIG3_PWR_REFBUF;
-		/* Use 4V VREF when power supply is at least 4.4V */
-		if (regulator_get_voltage(priv->reg_avdd) >= 4400000)
+		/* ADS1298 only: use 4V VREF when supply is at least 4.4V */
+		if (!priv->chip_info->is_ads1299 &&
+		    regulator_get_voltage(priv->reg_avdd) >= 4400000)
 			val |= ADS1298_MASK_CONFIG3_VREF_4V;
 	}
 	return regmap_write(priv->regmap, ADS1298_REG_CONFIG3, val);
@@ -646,6 +707,10 @@ static int ads1298_probe(struct spi_device *spi)
 		return -ENOMEM;
 
 	priv = iio_priv(indio_dev);
+
+	priv->chip_info = spi_get_device_match_data(spi);
+	if (!priv->chip_info)
+		return -ENODEV;
 
 	/* Reset to be asserted before enabling clock and power */
 	reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
@@ -743,13 +808,15 @@ static int ads1298_probe(struct spi_device *spi)
 }
 
 static const struct spi_device_id ads1298_id[] = {
-	{ .name = "ads1298" },
+	{ .name = "ads1298", .driver_data = (kernel_ulong_t)&ads1298_chip_info },
+	{ .name = "ads1299", .driver_data = (kernel_ulong_t)&ads1299_chip_info },
 	{ }
 };
 MODULE_DEVICE_TABLE(spi, ads1298_id);
 
 static const struct of_device_id ads1298_of_table[] = {
-	{ .compatible = "ti,ads1298" },
+	{ .compatible = "ti,ads1298", .data = &ads1298_chip_info },
+	{ .compatible = "ti,ads1299", .data = &ads1299_chip_info },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, ads1298_of_table);
@@ -765,5 +832,5 @@ static struct spi_driver ads1298_driver = {
 module_spi_driver(ads1298_driver);
 
 MODULE_AUTHOR("Mike Looijmans <mike.looijmans@topic.nl>");
-MODULE_DESCRIPTION("TI ADS1298 ADC");
+MODULE_DESCRIPTION("TI ADS1298/ADS1299 biopotential ADC");
 MODULE_LICENSE("GPL");
