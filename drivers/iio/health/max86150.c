@@ -126,6 +126,11 @@ enum max86150_scan_idx {
 	MAX86150_IDX_TS,
 };
 
+/*
+ * REVIEW(Jonathan Cameron): "Why does this need to be dma safe?" -- re: the
+ * @fifo_raw justification below. Either firm up why this specific regmap
+ * bus path actually DMAs a driver-supplied buffer, or trim the claim.
+ */
 /**
  * struct max86150_data - driver private state
  * @regmap:           register map for this device
@@ -221,9 +226,22 @@ static int max86150_read_one_sample(struct max86150_data *data,
 	*ppg_red = get_unaligned_be24(&data->fifo_raw[0]) & GENMASK(18, 0);
 	*ppg_ir  = get_unaligned_be24(&data->fifo_raw[3]) & GENMASK(18, 0);
 	*ecg = sign_extend32(get_unaligned_be24(&data->fifo_raw[6]) & GENMASK(17, 0), 17);
+
+	/* REVIEW(Jonathan Cameron): blank line before a simple success return helps readability. */
 	return 0;
 }
 
+/*
+ * REVIEW(Jonathan Cameron): "What is locked? Direct mode is claimed and
+ * under the hood that includes a lock but that is an implementation
+ * detail. I was expecting to see a local lock in the caller but there
+ * isn't one." -- rename, or restructure so the name isn't implying a lock
+ * that doesn't exist here.
+ *
+ * REVIEW(Jonathan Cameron): "There are 3 layers of wrapping going on here.
+ * That seems excessive." -- applies to this function plus
+ * max86150_do_read_raw() below; see the second half of that comment there.
+ */
 /* Does the actual work for max86150_do_read_raw(); see that function for the shutdown wrapping. */
 static int max86150_read_raw_locked(struct max86150_data *data,
 				    u32 *ppg_red, u32 *ppg_ir, s32 *ecg)
@@ -274,6 +292,18 @@ static int max86150_read_raw_locked(struct max86150_data *data,
 	return max86150_read_one_sample(data, ppg_red, ppg_ir, ecg);
 }
 
+/*
+ * REVIEW(Jonathan Cameron): "This comment isn't needed as the code is
+ * fairly obvious."
+ *
+ * REVIEW(Jonathan Cameron): "We've ended up with too many layers of
+ * wrappers. Just have this code in the max86150_read_raw() instead of
+ * having this one." -- fold max86150_do_read_raw() and
+ * max86150_read_raw_locked() away; put the shutdown-wake / FIFO-reset /
+ * poll / read / shutdown-restore sequence directly in the
+ * IIO_CHAN_INFO_RAW case of max86150_read_raw() below. max86150_read_one_sample()
+ * stays as its own function since the IRQ handler also calls it.
+ */
 /*
  * Take the device out of shutdown, reset the FIFO pointers, wait for the
  * first PPG sample, and read it back.  Always returns the device to
@@ -332,6 +362,19 @@ static const struct iio_info max86150_iio_info = {
 	.read_raw = max86150_read_raw,
 };
 
+/*
+ * REVIEW(Jonathan Cameron): "Sashiko calls out that there maybe a race
+ * between an ongoing threaded handler and this. Given the threaded
+ * handler requires use of active_scan_masks that is a race that should
+ * be closed. The suggestion to disable irqs is a bad one. Instead we may
+ * need to synchronize irqs after this code has ensured we should see no
+ * new ones. That should close the race I think" -- add
+ * synchronize_irq(client->irq) here, after INT_ENABLE1 is cleared, so a
+ * threaded handler already in flight finishes (or a not-yet-started one
+ * is guaranteed not to start) before predisable() returns and the core
+ * is free to tear down active_scan_mask. Same race applies to the
+ * active_scan_mask reads in max86150_irq_handler() below.
+ */
 static int max86150_buffer_predisable(struct iio_dev *indio_dev)
 {
 	struct max86150_data *data = iio_priv(indio_dev);
@@ -393,6 +436,11 @@ static const struct iio_buffer_setup_ops max86150_buffer_setup_ops = {
 	.predisable = max86150_buffer_predisable,
 };
 
+/*
+ * REVIEW(Jonathan Cameron): "What does this comment print us? Very little
+ * that I can see that we can't see from the code. It is all standard
+ * stuff for a fifo equipped part." -- trim or drop.
+ */
 /*
  * Threaded IRQ handler (primary=NULL): clears INT_STATUS1 to de-assert the
  * line, then drains every sample currently in the FIFO and pushes each one
@@ -458,6 +506,20 @@ static irqreturn_t max86150_irq_handler(int irq, void *private)
 		if (ret)
 			break;
 
+		/*
+		 * REVIEW(Jonathan Cameron): these active_scan_mask reads are
+		 * the other half of the predisable() race Sashiko flagged --
+		 * see the REVIEW comment on max86150_buffer_predisable() above.
+		 *
+		 * REVIEW(Jonathan Cameron): "I'm also not sure they are
+		 * useful. If you have to read all the channels back from the
+		 * device anyway, the core support for demuxing data if you
+		 * set available_scan_mask is probably a better way to handle
+		 * this." -- consider always populating all three data slots
+		 * (we already read all three off the FIFO every time) and
+		 * letting the IIO core demux to whatever's actually enabled,
+		 * instead of this manual test_bit()/j++ packing.
+		 */
 		memset(data->scan, 0, sizeof(data->scan));
 		j = 0;
 
@@ -468,12 +530,23 @@ static irqreturn_t max86150_irq_handler(int irq, void *private)
 		if (test_bit(MAX86150_IDX_ECG, indio_dev->active_scan_mask))
 			data->scan[j++] = ecg;
 
+		/* REVIEW(Jonathan Cameron): "Use the newer _with_ts() variant.
+		 * This one is going away once we've finished converting drivers
+		 * over." -- confirmed in include/linux/iio/buffer.h,
+		 * iio_push_to_buffers_with_timestamp() is marked DEPRECATED in
+		 * favour of iio_push_to_buffers_with_ts(indio_dev, data->scan,
+		 * sizeof(data->scan), ts).
+		 */
 		iio_push_to_buffers_with_timestamp(indio_dev, data->scan, ts);
 	}
 
 	return IRQ_HANDLED;
 }
 
+/*
+ * REVIEW(Jonathan Cameron): "No need for the comment. If anyone actually
+ * thinks they can add the returns they'll rapidly figure it out!"
+ */
 /*
  * This is a devm_add_action_or_reset() callback, so it can't return an
  * error like the rest of this driver does -- dev_warn() is the only way
@@ -504,6 +577,12 @@ static int max86150_chip_init(struct max86150_data *data)
 	if (ret)
 		return ret;
 
+	/*
+	 * REVIEW(Jonathan Cameron): "So why wait 10? We don't generally add
+	 * margins as we get a bit extra anyway from the surrounding calls
+	 * and datasheets tend to be conservative." -- reduce this margin
+	 * over the datasheet's 1 ms figure.
+	 */
 	/* SYS_RESET self-clears within 1 ms (datasheet SYS_CTRL register) */
 	fsleep(10 * USEC_PER_MSEC);
 
@@ -588,6 +667,19 @@ static int max86150_probe(struct i2c_client *client)
 	if (ret)
 		return dev_err_probe(dev, ret, "Cannot read part ID\n");
 
+	/*
+	 * REVIEW(Jonathan Cameron): "This doesn't align with the current
+	 * thinking on device tree fallback compatible handling. If the
+	 * firmware is wrong then people get to keep the pieces and so we
+	 * should at most print an informational message and then carry on
+	 * anyway. A mismatched ID can also mean a future compatible part
+	 * that has a different ID. Thankfully people are very careful with
+	 * firmwares when there is any chance of the bad form of smoke
+	 * emerging!" -- this is the second time this exact point has come
+	 * up (also raised on v10); the justifying comment below isn't
+	 * enough this time, the fatal return needs to actually become a
+	 * dev_info() + fall through to max86150_chip_init().
+	 */
 	/*
 	 * Deliberately fatal, not a dev_warn()+continue: chip_init() below
 	 * writes FIFO/PPG/LED configuration blind, with no readback. A
