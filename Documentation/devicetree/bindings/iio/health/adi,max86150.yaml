@@ -1,4 +1,9 @@
 # SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# NOTE(review notes, not for upstream): Rob Herring gave this patch (v11 1/2,
+# dt-bindings) a Reviewed-by on 2026-09-24 -- add
+# "Reviewed-by: Rob Herring (Arm) <robh@kernel.org>" as a trailer on this
+# patch's commit message in v12 to preserve that credit; no content changes
+# were requested for this file.
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/iio/health/adi,max86150.yaml#
