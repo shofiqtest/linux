@@ -102,12 +102,53 @@ static int amdxdna_carveout_show(struct seq_file *m, void *unused)
  */
 AMDXDNA_DBGFS_FOPS(carveout, amdxdna_carveout_show, amdxdna_carveout_write);
 
+static int amdxdna_fw_version_show(struct seq_file *m, void *unused)
+{
+	struct amdxdna_dev *xdna = m->private;
+
+	seq_printf(m, "%d.%d.%d.%d\n",
+		   xdna->fw_ver.major, xdna->fw_ver.minor,
+		   xdna->fw_ver.sub, xdna->fw_ver.build);
+	return 0;
+}
+
+AMDXDNA_DBGFS_FOPS(fw_version, amdxdna_fw_version_show, NULL);
+
+static int amdxdna_device_info_show(struct seq_file *m, void *unused)
+{
+	struct amdxdna_dev *xdna = m->private;
+
+	seq_printf(m, "vbnv:        %s\n", xdna->vbnv);
+	seq_printf(m, "device_type: %d\n", xdna->dev_info->device_type);
+	return 0;
+}
+
+AMDXDNA_DBGFS_FOPS(device_info, amdxdna_device_info_show, NULL);
+
+static int amdxdna_clients_show(struct seq_file *m, void *unused)
+{
+	struct amdxdna_dev *xdna = m->private;
+	struct amdxdna_client *client;
+
+	guard(mutex)(&xdna->client_lock);
+	list_for_each_entry(client, &xdna->client_list, node)
+		seq_printf(m, "pid %d heap_usage %zu total_bo_usage %zu\n",
+			   client->pid, client->heap_usage,
+			   client->total_bo_usage);
+	return 0;
+}
+
+AMDXDNA_DBGFS_FOPS(clients, amdxdna_clients_show, NULL);
+
 static const struct {
 	const char *name;
 	const struct file_operations *fops;
 	umode_t mode;
 } amdxdna_dbgfs_files[] = {
 	AMDXDNA_DBGFS_FILE(carveout, 0600),
+	AMDXDNA_DBGFS_FILE(fw_version, 0400),
+	AMDXDNA_DBGFS_FILE(device_info, 0400),
+	AMDXDNA_DBGFS_FILE(clients, 0400),
 };
 
 void amdxdna_debugfs_init(struct amdxdna_dev *xdna)
